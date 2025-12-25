@@ -35,12 +35,14 @@ if __name__ == "__main__":
 
     # UR5 dataset path (NPZ from preprocess)
     parser.add_argument("--npz", type=str, required=False,
-                        default="/workspace/shared/data/processed/delan_ur5_dataset.npz",
+                        default="/workspace/shared/data/preprocessed/delan_ur5_dataset.npz",
                         help="Path to delan_ur5_dataset.npz")
 
     # structured vs black_box (same as jax_example_DeLaN.py)
     parser.add_argument("-t", nargs=1, type=str, required=False, default=['structured'],
                         help="Lagrangian Type: structured|black_box")
+
+    parser.add_argument("--save_path", type=str, default="/workspace/shared/models/delan/delan_ur5.jax")
 
     args = parser.parse_args()
     seed, cuda, render, load_model, save_model = init_env(args)
@@ -170,9 +172,10 @@ if __name__ == "__main__":
                   f"Power={float(logs['energy_mean']):.2e}")
 
     if save_model:
-        os.makedirs("data/delan_models", exist_ok=True)
-        with open(f"data/delan_models/delan_{model_id}_{hyper['dataset']}_seed_{seed}.jax", "wb") as f:
+        os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
+        with open(args.save_path, "wb") as f:
             pickle.dump({"epoch": epoch_i, "hyper": hyper, "params": params, "seed": seed}, f)
+        print(f"Saved DeLaN checkpoint: {args.save_path}")
 
     print("\n################################################")
     print("Evaluating DeLaN (UR5):")
