@@ -7,14 +7,23 @@ import jax
 import jax.numpy as jnp
 import optax
 import haiku as hk
+import json
+from datetime import datetime
 
-import matplotlib as mp
-try:
-    mp.use("Qt5Agg")
-    mp.rc('text', usetex=False)
-    import matplotlib.pyplot as plt
-except:
-    plt = None
+# Matplotlib must be configured AFTER args are parsed (render vs headless).
+plt = None
+
+def _init_matplotlib(render: bool):
+    """Return pyplot (plt) or None. Uses Qt5Agg only when render=True, else Agg."""
+    try:
+        import matplotlib as mp
+        backend = "Qt5Agg" if render else "Agg"
+        mp.use(backend, force=True)
+        import matplotlib.pyplot as _plt
+        return _plt
+    except Exception as e:
+        print(f"[warn] Matplotlib disabled: {e}")
+        return None
 
 import deep_lagrangian_networks.jax_DeLaN_model as delan
 from deep_lagrangian_networks.replay_memory import ReplayMemory
@@ -22,7 +31,6 @@ from deep_lagrangian_networks.utils import init_env, activations, load_npz_traje
 
 import os
 os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.4'
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -67,21 +75,26 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
+    render_flag = bool(args.r[0])   # keep your existing render handling
+    plt = _init_matplotlib(render_flag)
+
     # --- NEW: derive per-model output directory from save_path ---
     save_path = args.save_path
-    base_save_dir = os.path.dirname(save_path)
-
-    # model "name" = filename without extension
     model_stem = os.path.splitext(os.path.basename(save_path))[0]
+    base_save_dir = os.path.dirname(save_path)
 
     run_name = model_stem  # UI-aligned name (derived from --save_path)
 
-    # folder for this trained model (checkpoint + plots)
-    model_dir = os.path.join(base_save_dir, model_stem)
-    os.makedirs(model_dir, exist_ok=True)
+    # If save_path is already inside a folder named like the run (model_stem),
+    # don't create model_stem/model_stem nesting.
+    if os.path.basename(base_save_dir) == model_stem:
+        model_dir = base_save_dir
+        ckpt_path = save_path
+    else:
+        model_dir = os.path.join(base_save_dir, model_stem)
+        ckpt_path = os.path.join(model_dir, os.path.basename(save_path))
 
-    # checkpoint will be written into model_dir
-    ckpt_path = os.path.join(model_dir, os.path.basename(save_path))
+    os.makedirs(model_dir, exist_ok=True)
 
     seed, cuda, render, load_model, save_model = init_env(args)
     rng_key = jax.random.PRNGKey(seed)
@@ -130,6 +143,17 @@ if __name__ == "__main__":
     }
     hyper.update(PRESETS.get(args.hp_preset, {}))
 
+    if args.activation is not None: hyper["activation"] = args.activation
+
+    # JSON-safe hyper (lagrangian_type is a function -> store its name)
+    hyper_json = dict(hyper)
+    if "lagrangian_type" in hyper_json and hasattr(hyper_json["lagrangian_type"], "__name__"):
+        hyper_json["lagrangian_type"] = hyper_json["lagrangian_type"].__name__
+    else:
+        hyper_json["lagrangian_type"] = str(hyper_json.get("lagrangian_type"))
+
+    print(f"Final hyper: {hyper}")
+
     # --- NEW: explicit overrides (if UI sets them) ---
     if args.n_width is not None: hyper["n_width"] = args.n_width
     if args.n_depth is not None: hyper["n_depth"] = args.n_depth
@@ -163,6 +187,30 @@ if __name__ == "__main__":
     print(f"  hp_preset = {args.hp_preset}")
     print("################################################")
 
+    # ---- NEW: metrics JSON scaffold (written at end; updated along the way) ----
+    metrics = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "run_name": run_name,
+        "model_type": model_choice,
+        "hp_preset": args.hp_preset,
+        "npz": args.npz,
+        "model_dir": model_dir,
+        "ckpt_path": ckpt_path,
+        "seed": int(seed),
+        "dt": float(dt) if "dt" in locals() else None,
+        "n_dof": None,  # fill after dataset load
+        "hyper": hyper_json,
+        "args": {
+            "render": int(args.r[0]),
+            "eval_every": int(args.eval_every),
+            "eval_n": int(args.eval_n),
+        },
+        "dataset": {},
+        "train": {},
+        "eval_test": {},
+        "artifacts": {},
+    }
+
     # Load NPZ dataset (EFFORT treated as TAU)
     train_data, test_data, divider, dt = load_npz_trajectory_dataset(args.npz)
     train_labels, train_qp, train_qv, train_qa, train_tau = train_data
@@ -180,6 +228,15 @@ if __name__ == "__main__":
     print(f"  Train samples = {train_qp.shape[0]}")
     print(f"  Test samples  = {test_qp.shape[0]}")
     print("################################################\n")
+
+    metrics["n_dof"] = int(n_dof)
+    metrics["dt"] = float(dt)
+    metrics["dataset"] = {
+        "train_trajectories": int(len(train_labels)),
+        "test_trajectories": int(len(test_labels)),
+        "train_samples": int(train_qp.shape[0]),
+        "test_samples": int(test_qp.shape[0]),
+    }
 
     # Replay memory (same pattern as jax_example_DeLaN.py)
     mem_dim = ((n_dof,), (n_dof,), (n_dof,), (n_dof,))
@@ -348,6 +405,10 @@ if __name__ == "__main__":
                 f.write(f"{e},{ts},{lo},{inv},{fo},{en}\n")
         print(f"Saved training history: {csv_path}")
 
+        metrics["artifacts"]["train_history_csv"] = csv_path
+        metrics["artifacts"]["loss_curve_png"] = loss_path
+        metrics["artifacts"]["loss_components_png"] = comp_path
+
     # --- NEW: elbow plot (train loss + test MSE over epochs) ---
     if plt is not None and len(hist_epoch) > 0 and len(hist_test_epoch) > 0:
         fig = plt.figure(figsize=(8, 4), dpi=120)
@@ -376,6 +437,13 @@ if __name__ == "__main__":
         plt.close(fig)
         print(f"Saved elbow plot: {elbow_path}")
 
+        metrics["artifacts"]["elbow_png"] = elbow_path
+
+    metrics["train"]["epochs_ran"] = int(epoch_i)
+    metrics["train"]["history_points"] = int(len(hist_epoch))
+    metrics["train"]["elbow_points"] = int(len(hist_test_epoch))
+
+
     print("\n################################################")
     print(f"Evaluating DeLaN | run={run_name}")
 
@@ -384,13 +452,72 @@ if __name__ == "__main__":
     qdd = jnp.array(test_qa)
 
     t0_eval = time.perf_counter()
+
     pred_tau = delan_model(params, None, q, qd, qdd, 0.0 * q)[1]
     t_eval = (time.perf_counter() - t0_eval) / float(q.shape[0])
 
-    err_tau = float((1.0 / q.shape[0]) * jnp.sum((pred_tau - jnp.array(test_tau)) ** 2))
-    print(f"Torque MSE = {err_tau:.3e}")
+    tau_true = jnp.array(test_tau)
+    err = pred_tau - tau_true
+
+    # global MSE over all samples + joints
+    err_tau = float(jnp.mean(err ** 2))
+    err_tau_rmse = float(np.sqrt(err_tau))
+
+    # per-joint MSE / RMSE
+    err_tau_j = np.array(jnp.mean(err ** 2, axis=0))          # shape: (n_dof,)
+    err_tau_rmse_j = np.sqrt(err_tau_j)
+
+    print(f"Torque MSE  = {err_tau:.3e}")
+    print(f"Torque RMSE = {err_tau_rmse:.3e}")
+    print("Per-joint MSE :", " ".join([f"{x:.3e}" for x in err_tau_j]))
+    print("Per-joint RMSE:", " ".join([f"{x:.3e}" for x in err_tau_rmse_j]))
     print(f"Comp Time per Sample = {t_eval:.3e}s / {1./t_eval:.1f}Hz")
 
+    # ----------------------------
+    # Save eval metrics (ALWAYS)
+    # ----------------------------
+    metrics["eval_test"] = {
+        "torque_mse": float(err_tau),
+        "torque_rmse": float(err_tau_rmse),
+        "torque_mse_per_joint": [float(x) for x in err_tau_j],
+        "torque_rmse_per_joint": [float(x) for x in err_tau_rmse_j],
+        "time_per_sample_s": float(t_eval),
+        "hz": float(1.0 / t_eval) if t_eval > 0 else None,
+    }
+
+    # Always write txt/json even in headless mode
+    metrics_path = os.path.join(model_dir, "metrics_test.txt")
+    with open(metrics_path, "w") as f:
+        f.write(f"run_name={run_name}\n")
+        f.write(f"hp_preset={args.hp_preset}\n")
+        f.write(f"hyper={hyper}\n")
+        f.write(f"npz={args.npz}\n")
+        f.write(f"ckpt={ckpt_path}\n")
+        f.write(f"seed={seed}\n")
+        f.write(f"model_type={model_choice}\n")
+        f.write(f"dt={dt}\n")
+        f.write(f"n_dof={n_dof}\n")
+        f.write(f"torque_mse={err_tau}\n")
+        f.write(f"torque_rmse={err_tau_rmse}\n")
+        f.write("torque_mse_per_joint=" + " ".join([str(float(x)) for x in err_tau_j]) + "\n")
+        f.write("torque_rmse_per_joint=" + " ".join([str(float(x)) for x in err_tau_rmse_j]) + "\n")
+        f.write(f"time_per_sample_s={t_eval}\n")
+        f.write(f"hz={1.0/t_eval if t_eval > 0 else None}\n")
+    print(f"Saved metrics TXT: {metrics_path}")
+
+    metrics_json_path = os.path.join(model_dir, "metrics.json")
+    with open(metrics_json_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Saved metrics JSON: {metrics_json_path}")
+
+    # Register artifacts we already wrote
+    metrics.setdefault("artifacts", {})
+    metrics["artifacts"]["metrics_txt"] = metrics_path
+    metrics["artifacts"]["metrics_json"] = metrics_json_path
+
+    # ----------------------------
+    # Plot torque (ONLY if matplotlib available)
+    # ----------------------------
     if plt is not None:
         pred_tau_np = np.array(pred_tau)
 
@@ -412,26 +539,11 @@ if __name__ == "__main__":
 
         plt.tight_layout()
 
-        # --- NEW: always save plot into per-model folder ---
-        plot_path = os.path.join(model_dir, f"{run_name}__{model_choice}__seed{seed}__DeLaN_Torque.png")
+        plot_path = os.path.join(model_dir, f"{run_name}__DeLaN_Torque.png")
         fig.savefig(plot_path, dpi=150)
         print(f"Saved plot: {plot_path}")
 
-        # optional: save a tiny metrics txt next to the plot
-        metrics_path = os.path.join(model_dir, "metrics_test.txt")
-        with open(metrics_path, "w") as f:
-            f.write(f"run_name={run_name}\n")
-            f.write(f"hp_preset={args.hp_preset}\n")
-            f.write(f"hyper={hyper}\n")
-            f.write(f"npz={args.npz}\n")
-            f.write(f"ckpt={ckpt_path}\n")
-            f.write(f"seed={seed}\n")
-            f.write(f"model_type={model_choice}\n")
-            f.write(f"dt={dt}\n")
-            f.write(f"n_dof={n_dof}\n")
-            f.write(f"torque_mse={err_tau}\n")
-            f.write(f"time_per_sample={t_eval}\n")
-        print(f"Saved metrics: {metrics_path}")
+        metrics["artifacts"]["torque_plot_png"] = plot_path
 
         # show only if render=1
         if render:
